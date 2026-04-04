@@ -1,312 +1,611 @@
-import torch
-from argparse import ArgumentParser
-import wandb 
-from vllm.model_executor import set_random_seed as vllm_set_random_seed
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from unittest.mock import patch
-from vllm import LLM, SamplingParams
-import random
 import json
-from cs336_alignment.utils import tokenize_prompt_and_output, get_response_log_probs, masked_normalize, compute_entropy, sft_microbatch_train_step
-from drgrpo_grader import r1_zero_reward_fn
-from typing import Callable, List, Tuple
+import os
+import random
 import re
-from math_baseline import run_vllm
-from transformers import PreTrainedTokenizerBase
+import argparse
+from argparse import ArgumentParser
+from typing import Callable, List
+from unittest.mock import patch
+
+import torch
 import torch.nn as nn
+import wandb
+from transformers import AutoModelForCausalLM, AutoTokenizer, PreTrainedTokenizerBase
+from vllm import LLM, SamplingParams
+from vllm.model_executor import set_random_seed as vllm_set_random_seed
+
+from cs336_alignment.drgrpo_grader_anypo import r1_zero_reward_fn
+from cs336_alignment.math_baseline_anypo import run_vllm
+from cs336_alignment.utils_anypo import (
+    get_response_log_probs,
+    sft_microbatch_train_step,
+    tokenize_prompt_and_output,
+)
 
 
-QWEN_MATH_BASE_PATH = "/home/bkzhu/storage/assignment5-alignment/data/a5-alignment/models/Qwen2.5-Math-1.5B"   
-PROMPT_PATH = "/home/bkzhu/storage/assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt" 
+QWEN_MATH_BASE_PATH = "/home/bkzhu/storage/assignment5-alignment/data/a5-alignment/models/Qwen2.5-Math-1.5B"
+PROMPT_PATH = "/home/bkzhu/storage/assignment5-alignment/cs336_alignment/prompts/r1_zero.prompt"
 TEST_DATA_PATH = "/home/bkzhu/storage/assignment5-alignment/data/gsm8k/test.jsonl"
-ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
+TRAIN_DATA_PATH = "/home/bkzhu/storage/assignment5-alignment/data/gsm8k/processed_train.jsonl"
 OUTPUT_PATH = "/home/bkzhu/storage/assignment5-alignment/data/ei_zero"
-MATH_DATA_PATH="/home/bkzhu/storage/assignment5-alignment/data/gsm8k/processed_train.jsonl"
-SEED  = 69
-torch.manual_seed(SEED)
-random.seed(SEED)
-device_train = "cuda:1"
-device_vllm = "cuda:2"
-micro_batch_size = 4
-n_sft_steps = 256
-n_grad_accum_steps = 8
-eval_steps = 16
 
-def extract_reference_answer2(answer: str) -> str:
-    match = ANS_RE.search(answer)
-    if match:
-        return match.group(1).strip().replace(",", "")
-    return "[invalid]"
+ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
+ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
 
-def extract_reference_answer(answer: str) -> str:
-    try:
-        extracted_answer = answer.split("<answer> ")[1].split(" </answer>")[0]
-        return extracted_answer.strip()
-    except:
-        return "[invalid]"
 
-def format_qa(data:list[str])->list[str]:
-    formatted = []
-    for d in data:
-        pair = {}
-        pair["prompt"] = d["prompt"]
-        pair["response"] = d["response"]
-        formatted.append(pair)
-    return formatted
+def to_float(val):
+    if isinstance(val, torch.Tensor):
+        return val.float().item()
+    return float(val)
 
-def format_qa_prompt(data:list[str], prompt_path:str)->list[str]:
-    formated_q = []
-    with open(prompt_path, "r", encoding="utf-8") as f:
-        prompt = f.read()
-    for d in data:
-        pair = {}
-        pair["prompt"] = prompt.format(question = d["question"])
-        pair["answer"] = d["answer"]
-        formated_q.append(pair)
-    return formated_q
 
-def load_jsonl(file_path:str)->List[str]:
+def load_jsonl(file_path: str) -> list[dict]:
     data = []
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             data.append(json.loads(line))
     return data
 
-def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float=0.85):
+
+def extract_reference_answer_gsm8k(answer: str) -> str:
+    match = ANS_RE.search(answer)
+    if match:
+        return match.group(1).strip().replace(",", "")
+    return "[invalid]"
+
+
+def extract_reference_answer_from_response(answer: str) -> str:
+    match = ANSWER_TAG_RE.search(answer)
+    if match:
+        return match.group(1).strip()
+    return "[invalid]"
+
+
+def format_qa(data: list[dict]) -> list[dict]:
+    formatted = []
+    for d in data:
+        formatted.append({"prompt": d["prompt"], "response": d["response"]})
+    return formatted
+
+
+def format_qa_prompt(data: list[dict], prompt_path: str) -> list[dict]:
+    formatted_q = []
+    with open(prompt_path, "r", encoding="utf-8") as f:
+        prompt = f.read()
+    for d in data:
+        formatted_q.append({"prompt": prompt.format(question=d["question"]), "answer": d["answer"]})
+    return formatted_q
+
+
+def prepare_train_test(train_data_path: str, test_data_path: str, prompt_path: str) -> tuple[list[dict], list[dict]]:
+    train_data = format_qa(load_jsonl(train_data_path))
+    test_data = format_qa_prompt(load_jsonl(test_data_path), prompt_path)
+    return train_data, test_data
+
+
+def init_vllm(model_id: str, device: str, seed: int, gpu_memory_utilization: float = 0.85) -> LLM:
     vllm_set_random_seed(seed)
     world_size_patch = patch("torch.distributed.get_world_size", return_value=1)
-    profiling_patch = patch("vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling", return_value=None)
+    profiling_patch = patch(
+        "vllm.worker.worker.Worker._assert_memory_footprint_increased_during_profiling",
+        return_value=None,
+    )
     with world_size_patch, profiling_patch:
         return LLM(
             model=model_id,
             device=device,
             dtype=torch.bfloat16,
             enable_prefix_caching=True,
-            gpu_memory_utilization=gpu_memory_utilization
+            gpu_memory_utilization=gpu_memory_utilization,
         )
-    
-def load_policy_into_vllm_instance(policy: torch.nn.Module, llm:LLM):
+
+
+def load_policy_into_vllm_instance(policy: torch.nn.Module, llm: LLM):
     state_dict = policy.state_dict()
     llm_model = llm.llm_engine.model_executor.driver_worker.model_runner.model
     llm_model.load_weights(state_dict.items())
 
-def prepare_train_test()->tuple[list[str], list[str]]:
-    train_data = load_jsonl(MATH_DATA_PATH)
-    train_data = format_qa(train_data)
 
-    test_data = load_jsonl(TEST_DATA_PATH)
-    test_data = format_qa_prompt(test_data, PROMPT_PATH)
-    return train_data, test_data
-
-def get_batch(tokenized_train_data: dict[str, torch.Tensor], batch_size: int, device: str):
-    batch_indices = random.sample(range(len(tokenized_train_data["input_ids"])), batch_size)
-    return {k: v[batch_indices].to(device) for k,v in tokenized_train_data.items()}
-
-def get_train_inf_batch(prompts:list[str], train_qa : list[dict[str, str]], batch_size: int)-> tuple[list[str], list[dict[str, str]]]:
-    batch_indices = random.sample(range(len(train_qa)), batch_size)
-    return [prompts[i] for i in batch_indices], [train_qa[i] for i in batch_indices]
-        
 def evaluate_vllm(
     vllm_model: LLM,
     reward_fn: Callable[[str, str], dict[str, float]],
     prompts: List[str],
     answers: List[str],
-    eval_sampling_params: SamplingParams
-):
+    eval_sampling_params: SamplingParams,
+) -> dict[str, float]:
     responses = run_vllm(vllm_model, prompts, eval_sampling_params)
-    allinfo_dict_list = []
-    for response, answer, prompt in zip(responses, answers, prompts):
-        extracted_answer = extract_reference_answer2(answer)
+    overview = {"correct": 0, "format_wrong": 0, "answer_wrong": 0, "count": 0}
+    for response, answer in zip(responses, answers):
+        extracted_answer = extract_reference_answer_gsm8k(answer)
         reward_dict = reward_fn(response, extracted_answer)
-        allinfo_dict_list.append(reward_dict)
-    overview = {"correct":0, "format_wrong":0, "answer_wrong":0, "count":0}
-    for reward in allinfo_dict_list:
         overview["count"] += 1
-        if reward["reward"] == 1:
+        if reward_dict["reward"] == 1:
             overview["correct"] += 1
-        elif reward["format_reward"] == 1:
+        elif reward_dict["format_reward"] == 1:
             overview["answer_wrong"] += 1
         else:
             overview["format_wrong"] += 1
     return overview
-def to_float(val):
-    if isinstance(val, torch.Tensor):
-        return val.float().item()
-    return float(val)
 
-def get_ei_sft_batch(tokenized_train_data, batch_size):
-    batch_indices = random.sample(range(len(tokenized_train_data["input_ids"])), batch_size)
-    return {k: v[batch_indices] for k,v in tokenized_train_data.items()}
 
-def ei_sft(sft_data: list[dict[str, str]], model:torch.nn.Module, tokenizer:PreTrainedTokenizerBase, vllm:torch.nn.Module, epoch:int, test_qa: list[dict[str, str]], global_step: int=0):
-    tokenized_train_data = tokenize_prompt_and_output(prompt_strs=[data["prompt"] for data in sft_data], 
-                                                      output_strs=[data["response"] for data in sft_data],
-                                                      tokenizer=tokenizer)
+def get_ei_sft_batch(tokenized_train_data: dict[str, torch.Tensor], batch_size: int) -> dict[str, torch.Tensor]:
+    total = len(tokenized_train_data["input_ids"])
+    if total == 0:
+        raise ValueError("Empty SFT dataset, cannot sample batch.")
+    if total >= batch_size:
+        batch_indices = random.sample(range(total), batch_size)
+    else:
+        batch_indices = [random.randrange(total) for _ in range(batch_size)]
+    return {k: v[batch_indices] for k, v in tokenized_train_data.items()}
+
+
+def chunk_list(data: list[dict], chunk_size: int) -> list[list[dict]]:
+    return [data[i : i + chunk_size] for i in range(0, len(data), chunk_size)]
+
+
+def compute_train_pass_rates(
+    vllm: LLM,
+    train_qa: list[dict],
+    num_rollouts: int,
+    batch_size: int,
+    max_tokens: int,
+    temperature: float,
+) -> list[dict]:
+    stats: list[dict] = []
+    if len(train_qa) == 0:
+        return stats
+
+    for batch in chunk_list(train_qa, max(batch_size, 1)):
+        prompts = [item["prompt"] for item in batch]
+        sampling_params = SamplingParams(
+            temperature=temperature,
+            top_p=1.0,
+            max_tokens=max_tokens,
+            min_tokens=4,
+            stop=["</answer>"],
+            include_stop_str_in_output=True,
+            n=num_rollouts,
+        )
+        outputs = vllm.generate(prompts, sampling_params)
+        for output, train_data in zip(outputs, batch):
+            gt_answer = extract_reference_answer_from_response(train_data["response"])
+            correct_count = 0
+            for candidate in output.outputs:
+                metrics = r1_zero_reward_fn(candidate.text.strip(), gt_answer)
+                correct_count += int(metrics["reward"] > 0)
+            pass_rate = correct_count / max(num_rollouts, 1)
+            stats.append(
+                {
+                    "prompt": train_data["prompt"],
+                    "response": train_data["response"],
+                    "correct_count": correct_count,
+                    "attempt_count": num_rollouts,
+                    "pass_rate": pass_rate,
+                }
+            )
+    return stats
+
+
+def select_train_pool(
+    train_qa: list[dict],
+    train_stats: list[dict],
+    threshold: float,
+) -> tuple[list[dict], dict[str, float]]:
+    if len(train_qa) != len(train_stats):
+        raise ValueError("train_qa and train_stats must have same length")
+
+    selected = []
+    pass_rates = []
+    for item, stat in zip(train_qa, train_stats):
+        pass_rates.append(stat["pass_rate"])
+        if stat["pass_rate"] >= threshold:
+            selected.append(item)
+
+    fallback_used = 0.0
+    if len(selected) == 0 and len(train_qa) > 0:
+        fallback_used = 1.0
+        top_idx = max(range(len(train_stats)), key=lambda idx: train_stats[idx]["pass_rate"])
+        selected = [train_qa[top_idx]]
+
+    mean_pass = sum(pass_rates) / max(len(pass_rates), 1)
+    return selected, {
+        "selected_count": float(len(selected)),
+        "selected_ratio": float(len(selected) / max(len(train_qa), 1)),
+        "mean_pass_rate": float(mean_pass),
+        "threshold": float(threshold),
+        "selection_fallback_used": fallback_used,
+    }
+
+
+def sample_train_batch(train_qa: list[dict], batch_size: int) -> list[dict]:
+    if len(train_qa) == 0:
+        return []
+    if len(train_qa) >= batch_size:
+        batch_indices = random.sample(range(len(train_qa)), batch_size)
+    else:
+        batch_indices = [random.randrange(len(train_qa)) for _ in range(batch_size)]
+    return [train_qa[i] for i in batch_indices]
+
+
+def collect_expert_rollouts(
+    vllm: LLM,
+    selected_pool: list[dict],
+    batch_size: int,
+    ei_num_g: int,
+    sampling_max_tokens: int = 512,
+) -> tuple[list[dict], dict[str, float]]:
+    batch = sample_train_batch(selected_pool, batch_size)
+    if len(batch) == 0:
+        return [], {
+            "total": 0.0,
+            "correct": 0.0,
+            "format_wrong": 0.0,
+            "format_correct_answer_wrong": 0.0,
+            "rollout_accuracy": 0.0,
+        }
+
+    prompts = [item["prompt"] for item in batch]
+    sampling_params = SamplingParams(
+        temperature=1.0,
+        top_p=1.0,
+        max_tokens=sampling_max_tokens,
+        min_tokens=4,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+        n=ei_num_g,
+    )
+    outputs = vllm.generate(prompts, sampling_params)
+    responses = [[o.text.strip() for o in output.outputs] for output in outputs]
+
+    expert_roll = []
+    overview = {"total": 0, "correct": 0, "format_wrong": 0, "format_correct_answer_wrong": 0}
+    for response_group, train_data in zip(responses, batch):
+        gt_answer = extract_reference_answer_from_response(train_data["response"])
+        for rollout in response_group:
+            overview["total"] += 1
+            metrics = r1_zero_reward_fn(rollout, gt_answer)
+            if metrics["reward"] > 0:
+                overview["correct"] += 1
+                expert_roll.append({"prompt": train_data["prompt"], "response": rollout})
+            elif metrics["format_reward"] > 0:
+                overview["format_correct_answer_wrong"] += 1
+            else:
+                overview["format_wrong"] += 1
+
+    overview_float = {
+        "total": float(overview["total"]),
+        "correct": float(overview["correct"]),
+        "format_wrong": float(overview["format_wrong"]),
+        "format_correct_answer_wrong": float(overview["format_correct_answer_wrong"]),
+        "rollout_accuracy": float(overview["correct"] / max(overview["total"], 1)),
+    }
+    return expert_roll, overview_float
+
+
+def save_ei_checkpoint(
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    output_path: str,
+    ei_step: int,
+    global_step: int,
+    selection_meta: dict[str, float],
+):
+    ckpt_root = os.path.join(output_path, "checkpoints")
+    ckpt_dir = os.path.join(ckpt_root, f"ei_step_{ei_step:04d}")
+    os.makedirs(ckpt_dir, exist_ok=True)
+    model.save_pretrained(ckpt_dir)
+    tokenizer.save_pretrained(ckpt_dir)
+    state = {
+        "ei_step": ei_step,
+        "global_step": global_step,
+        "selection_meta": selection_meta,
+    }
+    with open(os.path.join(ckpt_dir, "trainer_state.json"), "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(ckpt_root, "latest_checkpoint.txt"), "w", encoding="utf-8") as f:
+        f.write(ckpt_dir)
+
+
+def resolve_resume_checkpoint(output_path: str, resume_from: str, auto_resume: bool) -> str:
+    if resume_from:
+        return resume_from
+    if not auto_resume:
+        return ""
+    latest_path = os.path.join(output_path, "checkpoints", "latest_checkpoint.txt")
+    if not os.path.exists(latest_path):
+        return ""
+    with open(latest_path, "r", encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def load_resume_state(ckpt_dir: str) -> tuple[int, int]:
+    state_path = os.path.join(ckpt_dir, "trainer_state.json")
+    if not os.path.exists(state_path):
+        return 0, 0
+    with open(state_path, "r", encoding="utf-8") as f:
+        state = json.load(f)
+    return int(state.get("ei_step", -1)) + 1, int(state.get("global_step", 0))
+
+
+def ei_sft(
+    sft_data: list[dict[str, str]],
+    model: torch.nn.Module,
+    tokenizer: PreTrainedTokenizerBase,
+    vllm: LLM,
+    test_qa: list[dict[str, str]],
+    epochs: int,
+    micro_batch_size: int,
+    n_grad_accum_steps: int,
+    eval_steps: int,
+    device_train: str,
+    global_step: int = 0,
+) -> int:
+    if len(sft_data) == 0:
+        return global_step
+
+    tokenized_train_data = tokenize_prompt_and_output(
+        prompt_strs=[data["prompt"] for data in sft_data],
+        output_strs=[data["response"] for data in sft_data],
+        tokenizer=tokenizer,
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=2e-5)
-    
     amp_ctx = torch.amp.autocast(device_type=device_train, dtype=torch.bfloat16)
-    n_sft_steps = len(sft_data) * epoch // (n_grad_accum_steps * micro_batch_size) + 1
-    print (f"sft steps in this ei step: {n_sft_steps}")
-    for i in range(n_sft_steps):
-        for j in range(n_grad_accum_steps):
+
+    n_sft_updates = max(len(sft_data) * epochs // max(n_grad_accum_steps * micro_batch_size, 1), 1)
+    print(f"SFT updates in this EI step: {n_sft_updates}")
+
+    for update_idx in range(n_sft_updates):
+        for micro_idx in range(n_grad_accum_steps):
             with amp_ctx:
                 train_batch = get_ei_sft_batch(tokenized_train_data, micro_batch_size)
                 input_ids = train_batch["input_ids"].to(device_train)
                 labels = train_batch["labels"].to(device_train)
                 response_mask = train_batch["response_mask"].to(device_train)
                 response_log_probs = get_response_log_probs(model, input_ids, labels, True)
-                loss, _ = sft_microbatch_train_step(response_log_probs["log_probs"], response_mask, n_grad_accum_steps)
-                if j == n_grad_accum_steps - 1:
-                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1)
+                loss, _ = sft_microbatch_train_step(
+                    response_log_probs["log_probs"], response_mask, n_grad_accum_steps
+                )
+                if micro_idx == n_grad_accum_steps - 1:
+                    nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
                     optimizer.zero_grad()
                     entropy = response_log_probs["token_entropy"]
-                    print (f"Train step summary {i}/{n_sft_steps}:")
-                    print (f"Training loss: {loss:.6f}")
-                    print (f"Total response entropy: {entropy.mean().item():.4f}")
-                    print (f"Response entropy: {entropy[response_mask].mean().item():.4f}")
-                    print (f"Prompt entropy: {entropy[~response_mask].mean().item():.4f}")
 
-                    wandb.log({
-                        "train/loss": to_float(loss),
-                        "train/entropy": to_float(entropy.mean()),
-                        "train/response entropy": to_float(entropy[response_mask].mean()),
-                        "train/prompt entropy": to_float(entropy[~response_mask].mean()),
-                        "train_step": global_step+1
-                    })
+                    wandb.log(
+                        {
+                            "train/loss": to_float(loss),
+                            "train/entropy": to_float(entropy.mean()),
+                            "train/response_entropy": to_float(entropy[response_mask].mean()),
+                            "train/prompt_entropy": to_float(entropy[~response_mask].mean()),
+                            "train_step": global_step + 1,
+                        }
+                    )
                     global_step += 1
 
-        if (global_step % eval_steps == 0):
+        if global_step % eval_steps == 0:
             load_policy_into_vllm_instance(model, vllm)
-
-            sampling_params = SamplingParams(temperature = 1.0, top_p=1.0, max_tokens=1024, min_tokens=4, stop=["</answer>"], include_stop_str_in_output=True)
+            sampling_params = SamplingParams(
+                temperature=1.0,
+                top_p=1.0,
+                max_tokens=1024,
+                min_tokens=4,
+                stop=["</answer>"],
+                include_stop_str_in_output=True,
+            )
             test_prompt = [data["prompt"] for data in test_qa]
             test_answer = [data["answer"] for data in test_qa]
             overview = evaluate_vllm(vllm, r1_zero_reward_fn, test_prompt, test_answer, sampling_params)
 
-            print (f"evaluation at step {i}:")
-            print (f"Correct number: {overview["correct"]}")
-            print (f"Accurancy: {overview["correct"] / overview["count"] * 100:.2f}%")
-            print (f"Wrong answer with correct format:{overview["answer_wrong"]}")
-            print (f"Wrong format:{overview["format_wrong"]}")
+            wandb.log(
+                {
+                    "eval/correct": overview["correct"],
+                    "eval/correct format with wrong answer": overview["answer_wrong"],
+                    "eval/wrong format": overview["format_wrong"],
+                    "eval/accuracy": overview["correct"] / max(overview["count"], 1),
+                    "eval_step": global_step + 1,
+                }
+            )
 
-            wandb.log({
-                "eval/correct": overview["correct"],
-                "eval/correct format with wrong answer": overview["answer_wrong"],
-                "eval/wrong format": overview["format_wrong"],
-                "eval/accuracy": overview["correct"] / overview["count"],
-                "eval_step": global_step+1
-            })
+            print(f"Eval at update {update_idx}/{n_sft_updates}:")
+            print(f"  correct={overview['correct']}")
+            print(f"  accuracy={overview['correct'] / max(overview['count'], 1) * 100:.2f}%")
+            print(f"  format_correct_answer_wrong={overview['answer_wrong']}")
+            print(f"  format_wrong={overview['format_wrong']}")
+    return global_step
 
-            model.save_pretrained(save_directory=OUTPUT_PATH)
-            tokenizer.save_pretrained(save_directory=OUTPUT_PATH)
-    return model, global_step
 
-def main(n_ei_steps:int, batch_size:int, epochs:int, ei_num_g:int) -> None:
-    global_step = 0
-    wandb.init(project="cs336-ei-sft",
-        name=f"step_{n_ei_steps}_batch_size_{batch_size}_epochs_{epochs}_math_ei_sft",
-        config={
-            "n_ei_steps": n_ei_steps,
-            "batch_size": batch_size,
-            "epochs": epochs
-            }
-        )
+def main(args):
+    torch.manual_seed(args.seed)
+    random.seed(args.seed)
+
+    wandb.init(
+        project=args.project,
+        name=args.run_name
+        or f"ei_{args.selection_mode}_thr{args.train_pass_threshold}_steps{args.n_ei_steps}",
+        config=vars(args),
+    )
     wandb.define_metric("train_step")
     wandb.define_metric("eval_step")
+    wandb.define_metric("ei_step")
     wandb.define_metric("train/*", step_metric="train_step")
     wandb.define_metric("eval/*", step_metric="eval_step")
+    wandb.define_metric("selection/*", step_metric="ei_step")
+    wandb.define_metric("rollout/*", step_metric="ei_step")
+
+    resume_ckpt = resolve_resume_checkpoint(args.output_path, args.resume_from, args.auto_resume)
+    if resume_ckpt:
+        model_source = resume_ckpt
+        start_ei_step, global_step = load_resume_state(resume_ckpt)
+        print(f"Resuming from {resume_ckpt}, start_ei_step={start_ei_step}, global_step={global_step}")
+    else:
+        model_source = args.model_path
+        start_ei_step = 0
+        global_step = 0
 
     model = AutoModelForCausalLM.from_pretrained(
-        pretrained_model_name_or_path=QWEN_MATH_BASE_PATH,
+        pretrained_model_name_or_path=model_source,
         torch_dtype=torch.bfloat16,
         attn_implementation="flash_attention_2",
-        device_map=device_train
+        device_map=args.device_train,
     )
-    tokenizer = AutoTokenizer.from_pretrained(QWEN_MATH_BASE_PATH)
+    tokenizer = AutoTokenizer.from_pretrained(model_source)
+    vllm = init_vllm(args.model_path, args.device_vllm, args.seed, gpu_memory_utilization=args.gpu_memory_utilization)
+    load_policy_into_vllm_instance(model, vllm)
 
-    vllm = init_vllm(QWEN_MATH_BASE_PATH, device_vllm, SEED, gpu_memory_utilization=0.3)
+    train_qa, test_qa = prepare_train_test(args.train_data_path, args.test_data_path, args.prompt_path)
+    static_selected_pool: list[dict] | None = None
+    static_selection_meta: dict[str, float] | None = None
 
-    train_qa, test_qa = prepare_train_test()
+    if args.selection_mode == "static":
+        selection_rollouts = args.selection_num_g if args.selection_num_g > 0 else args.ei_num_g
+        train_stats = compute_train_pass_rates(
+            vllm,
+            train_qa,
+            selection_rollouts,
+            args.selection_batch_size,
+            args.selection_max_tokens,
+            args.selection_temperature,
+        )
+        static_selected_pool, static_selection_meta = select_train_pool(
+            train_qa, train_stats, args.train_pass_threshold
+        )
+        wandb.log(
+            {
+                "ei_step": start_ei_step,
+                "selection/selected_count": static_selection_meta["selected_count"],
+                "selection/selected_ratio": static_selection_meta["selected_ratio"],
+                "selection/mean_pass_rate": static_selection_meta["mean_pass_rate"],
+                "selection/threshold": static_selection_meta["threshold"],
+                "selection/fallback_used": static_selection_meta["selection_fallback_used"],
+            }
+        )
 
-    for i in range(n_ei_steps):
-        print ("------------------------------")
-        print (f"Expert iteration step: {i}")
-        print (f"Global step now: {global_step}")
-        prompts, train_qa = get_train_inf_batch(prompts = [i["prompt"] for i in train_qa], train_qa=train_qa, batch_size=batch_size)
+    for ei_step in range(start_ei_step, args.n_ei_steps):
+        print("------------------------------")
+        print(f"Expert iteration step: {ei_step}")
+        print(f"Global step now: {global_step}")
 
-        sampling_params = SamplingParams(temperature = 1.0, top_p=1.0, max_tokens=512, min_tokens=4, stop=["</answer>"], include_stop_str_in_output=True, n=ei_num_g)
-        outputs = vllm.generate(prompts, sampling_params)
-        responses = [[o.text.strip() for o in output.outputs] for output in outputs]
-        expert_roll = []
-        overview = {"total": 0, "correct": 0, "format_wrong": 0, "format_correct_answer_wrong": 0}
+        if args.selection_mode == "dynamic":
+            selection_rollouts = args.selection_num_g if args.selection_num_g > 0 else args.ei_num_g
+            train_stats = compute_train_pass_rates(
+                vllm,
+                train_qa,
+                selection_rollouts,
+                args.selection_batch_size,
+                args.selection_max_tokens,
+                args.selection_temperature,
+            )
+            selected_pool, selection_meta = select_train_pool(train_qa, train_stats, args.train_pass_threshold)
+        elif args.selection_mode == "static":
+            selected_pool = static_selected_pool if static_selected_pool is not None else train_qa
+            selection_meta = static_selection_meta if static_selection_meta is not None else {
+                "selected_count": float(len(selected_pool)),
+                "selected_ratio": float(len(selected_pool) / max(len(train_qa), 1)),
+                "mean_pass_rate": 0.0,
+                "threshold": args.train_pass_threshold,
+                "selection_fallback_used": 0.0,
+            }
+        else:
+            selected_pool = train_qa
+            selection_meta = {
+                "selected_count": float(len(selected_pool)),
+                "selected_ratio": 1.0,
+                "mean_pass_rate": 0.0,
+                "threshold": args.train_pass_threshold,
+                "selection_fallback_used": 0.0,
+            }
 
-        for response, train_data in zip(responses, train_qa):
-            answer = train_data["response"]
-            extracted_answer = extract_reference_answer(answer)
+        wandb.log(
+            {
+                "ei_step": ei_step,
+                "selection/selected_count": selection_meta["selected_count"],
+                "selection/selected_ratio": selection_meta["selected_ratio"],
+                "selection/mean_pass_rate": selection_meta["mean_pass_rate"],
+                "selection/threshold": selection_meta["threshold"],
+                "selection/fallback_used": selection_meta["selection_fallback_used"],
+            }
+        )
 
-            for rollout in response:
-                overview["total"] += 1
-                metrics = r1_zero_reward_fn(rollout, extracted_answer)
-                if metrics["reward"] > 0:
-                    
-                    overview["correct"] += 1
-                    expert_roll.append({
-                        "prompt": train_data["prompt"],
-                        "response": rollout
-                    })
-                elif metrics["format_reward"] > 0:
-                    overview["format_correct_answer_wrong"] += 1
-                else:
-                    overview["format_wrong"] += 1
+        sft_data, rollout_meta = collect_expert_rollouts(
+            vllm,
+            selected_pool,
+            args.batch_size,
+            args.ei_num_g,
+            sampling_max_tokens=args.rollout_max_tokens,
+        )
+        wandb.log(
+            {
+                "ei_step": ei_step,
+                "rollout/total": rollout_meta["total"],
+                "rollout/correct": rollout_meta["correct"],
+                "rollout/format_wrong": rollout_meta["format_wrong"],
+                "rollout/format_correct_answer_wrong": rollout_meta["format_correct_answer_wrong"],
+                "rollout/accuracy": rollout_meta["rollout_accuracy"],
+                "rollout/sft_data_size": float(len(sft_data)),
+            }
+        )
+        print(
+            "rollout summary: "
+            f"acc={rollout_meta['rollout_accuracy']*100:.2f}% "
+            f"correct={int(rollout_meta['correct'])} total={int(rollout_meta['total'])} "
+            f"sft_data_size={len(sft_data)}"
+        )
 
-        print (f"correction check:")
-        print (f"correct count: {overview["correct"]}")
-        print (f"acccuracy: {overview["correct"]/overview["total"] * 100:.2f}%")
-        print (f"format correct but answer wrong: {overview["format_correct_answer_wrong"]/overview["total"] * 100:.2f}%")
-        print (f"answer wrong: {overview["format_wrong"]/overview['total'] * 100:.2f}%")
-
-        # print (f"correct examples:")
-        # print (f"prompt:{expert_roll[0]["prompt"]}")
-        # print (f"response: {expert_roll[0]["response"]}")
-
-        sft_data = expert_roll
-        model, global_step = ei_sft(sft_data, model, tokenizer, vllm, epochs, test_qa, global_step)
-
+        global_step = ei_sft(
+            sft_data=sft_data,
+            model=model,
+            tokenizer=tokenizer,
+            vllm=vllm,
+            test_qa=test_qa,
+            epochs=args.epochs,
+            micro_batch_size=args.micro_batch_size,
+            n_grad_accum_steps=args.n_grad_accum_steps,
+            eval_steps=args.eval_steps,
+            device_train=args.device_train,
+            global_step=global_step,
+        )
         load_policy_into_vllm_instance(model, vllm)
+        save_ei_checkpoint(model, tokenizer, args.output_path, ei_step, global_step, selection_meta)
+
+    final_dir = os.path.join(args.output_path, "final")
+    os.makedirs(final_dir, exist_ok=True)
+    model.save_pretrained(final_dir)
+    tokenizer.save_pretrained(final_dir)
+    print(f"Training finished. Final checkpoint saved to {final_dir}")
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    # subparsers = parser.add_subparsers(dest="command")
+    parser.add_argument("--project", type=str, default="cs336-ei-sft")
+    parser.add_argument("--run_name", type=str, default="")
+    parser.add_argument("--model_path", type=str, default=QWEN_MATH_BASE_PATH)
+    parser.add_argument("--prompt_path", type=str, default=PROMPT_PATH)
+    parser.add_argument("--train_data_path", type=str, default=TRAIN_DATA_PATH)
+    parser.add_argument("--test_data_path", type=str, default=TEST_DATA_PATH)
+    parser.add_argument("--output_path", type=str, default=OUTPUT_PATH)
+    parser.add_argument("--seed", type=int, default=69)
+    parser.add_argument("--device_train", type=str, default="cuda:1")
+    parser.add_argument("--device_vllm", type=str, default="cuda:2")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.3)
 
-    # test_parser = subparsers.add_parser("test")
-    # test_parser.add_argument("--test_type")
-
-    # train_parser = subparsers.add_parser("train")
     parser.add_argument("--n_ei_steps", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=7000)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--ei_num_g", type=int, default=2)
-    args = parser.parse_args()
-    n_ei_steps = args.n_ei_steps
-    batch_size = args.batch_size
-    epochs = args.epochs
-    ei_num_g = args.ei_num_g
-    main(n_ei_steps, batch_size, epochs, ei_num_g)
-    # for test
-    # if args.command == "test":
-    #     if args.test_type == "load_data":
-    #         train, test = prepare_train_test(10)
-    #         print (train[0])
-    #         print ("-------")
-    #         print (test[0])
+    parser.add_argument("--micro_batch_size", type=int, default=4)
+    parser.add_argument("--n_grad_accum_steps", type=int, default=8)
+    parser.add_argument("--eval_steps", type=int, default=16)
+    parser.add_argument("--rollout_max_tokens", type=int, default=512)
 
-    # # for true run
-    # if args.command == "train":
-    #     if args.use_correct == False:
-            
-    #         train_samples = [7000]
-    #         dataset_type = "raw"
-    #     else:
-    #         MATH_DATA_PATH = "/home/aiscuser/repos/assignment5-alignment/data/gsm8k/correct.jsonl"
-    #         n_ei_steps = args.n_ei_steps
+    parser.add_argument("--selection_mode", choices=["none", "static", "dynamic"], default="none")
+    parser.add_argument("--train_pass_threshold", type=float, default=0.5)
+    parser.add_argument("--selection_num_g", type=int, default=0)
+    parser.add_argument("--selection_batch_size", type=int, default=256)
+    parser.add_argument("--selection_max_tokens", type=int, default=512)
+    parser.add_argument("--selection_temperature", type=float, default=1.0)
+
+    parser.add_argument("--resume_from", type=str, default="")
+    parser.add_argument("--auto_resume", action=argparse.BooleanOptionalAction, default=True)
+
+    args = parser.parse_args()
+    main(args)

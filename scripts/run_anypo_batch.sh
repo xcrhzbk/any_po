@@ -7,7 +7,7 @@ cd "$ROOT_DIR"
 MODE="${1:-smoke}" # smoke | full | token_fill | kl_ablation | dapo_ablation | gbpo_ablation
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 
-PROJECT="${WANDB_PROJECT:-cs336-anypo}"
+PROJECT="${WANDB_PROJECT:-cs336-anypo2}"
 GROUP="${WANDB_GROUP:-anypo_batch_${TIMESTAMP}}"
 SAVE_ROOT="${SAVE_ROOT:-$ROOT_DIR/data/anypo_ckpts/${GROUP}}"
 PYTHON_CMD="${PYTHON_CMD:-uv run python}"
@@ -17,7 +17,7 @@ if [[ "$MODE" == "smoke" ]]; then
   EVAL_FREQ="${EVAL_FREQ:-2}"
   EVAL_NUM_SAMPLES="${EVAL_NUM_SAMPLES:-128}"
 else
-  N_GRPO_STEPS="${N_GRPO_STEPS:-129}"
+  N_GRPO_STEPS="${N_GRPO_STEPS:-300}"
   EVAL_FREQ="${EVAL_FREQ:-8}"
   EVAL_NUM_SAMPLES="${EVAL_NUM_SAMPLES:-0}"
 fi

@@ -23,6 +23,7 @@
 - GBPO clip：`--gbpo_pos_cliprange_low --gbpo_pos_cliprange_high --gbpo_neg_cliprange_low --gbpo_neg_cliprange_high`
 - group filter：`--enable_group_filter --filter_all_zero --filter_all_one --max_filter_resample_rounds`
 - overlong penalty：`--use_overlong_penalty --overlong_target_len --overlong_penalty_coef`
+- final eval 输出：`--save_final_eval_outputs --final_eval_output_max_samples --final_eval_output_filename`
 - `--seed`
 - `--save_dir`（可选，保存 `best/final/step_xxx`）
 
@@ -95,29 +96,90 @@ bash scripts/run_anypo_batch.sh gbpo_ablation
 - `GBPO_POS_LOW` / `GBPO_POS_HIGH` / `GBPO_NEG_LOW` / `GBPO_NEG_HIGH`（`gbpo_ablation`）
 
 说明：批量脚本会自动把每个 run 保存到独立目录：`$SAVE_ROOT/$run_name`，不会互相覆盖。
+另外 AnyPO 在最后一个评估 step 会默认保存测试样本输出（默认 100 条）到：
+`$save_dir/final_eval_outputs.jsonl`。
 
-## 统一实验表（建议按这个对照看）
+## Math12k 数据准备
 
-| 模式 | run_name 后缀 | 主要改动 | 主要对照对象 | 重点看哪些指标 |
+已提供一键脚本：
+
+```bash
+uv run python cs336_alignment/prepare_math12k.py
+```
+
+会生成：
+- `data/math12k/train.jsonl`（AnyPO/GRPO 用，字段 `question/answer`）
+- `data/math12k/test.jsonl`
+- `data/math12k/processed_train.jsonl`（EI 用，字段 `prompt/response`）
+
+使用示例：
+
+```bash
+# AnyPO / GRPO 跑 math12k
+uv run python cs336_alignment/train_anypo.py \
+  --train_data_path /home/bkzhu/storage/assignment5-alignment/data/math12k/train.jsonl \
+  --test_data_path /home/bkzhu/storage/assignment5-alignment/data/math12k/test.jsonl
+
+# EI 跑 math12k
+uv run python cs336_alignment/ei.py \
+  --train_data_path /home/bkzhu/storage/assignment5-alignment/data/math12k/processed_train.jsonl \
+  --test_data_path /home/bkzhu/storage/assignment5-alignment/data/math12k/test.jsonl
+```
+
+## 统一实验表（完整可跑清单）
+
+命名规则：
+- 实际 run 名是 `${GROUP}_<suffix>`，下面表格列的是 `<suffix>`
+- `smoke` 和 `full` 跑的是同一批 suffix（只是步数不同）
+
+### A. baseline / token 组（12 组）
+
+| 模式 | suffix | loss_type | agg | std | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| `smoke/full` | `01_clip_seq_std0` | `grpo_clip` | `seq` | off | baseline |
+| `smoke/full` | `02_noclip_seq_std0` | `grpo_no_clip` | `seq` | off | 去掉 clip |
+| `smoke/full` | `03_reinforce_seq_std0` | `reinforce_with_baseline` | `seq` | off | REINFORCE+baseline |
+| `smoke/full` | `04_nobase_seq_std0` | `no_baseline` | `seq` | off | 无 baseline |
+| `smoke/full` | `05_clip_seq_std1` | `grpo_clip` | `seq` | on | 开 std norm |
+| `smoke/full` | `06_noclip_seq_std1` | `grpo_no_clip` | `seq` | on | no clip + std |
+| `smoke/full` | `07_clip_token_std0` | `grpo_clip` | `token` | off | token 聚合 |
+| `smoke/full` | `08_noclip_token_std0` | `grpo_no_clip` | `token` | off | token + no clip |
+| `token_fill` | `09_reinforce_token_std0` | `reinforce_with_baseline` | `token` | off | 补齐 token 对照 |
+| `token_fill` | `10_nobase_token_std0` | `no_baseline` | `token` | off | 补齐 token 对照 |
+| `token_fill` | `11_clip_token_std1` | `grpo_clip` | `token` | on | token + std |
+| `token_fill` | `12_noclip_token_std1` | `grpo_no_clip` | `token` | on | token + no clip + std |
+
+### B. KL 消融（4 组）
+
+| 模式 | suffix | loss_type | agg | 额外开关 | 主要对照 |
+| --- | --- | --- | --- | --- | --- |
+| `kl_ablation` | `kl00_clip_token_std0_no_kl` | `grpo_clip` | `token` | `--no-use_kl_penalty` | vs `kl01_*_token_*` |
+| `kl_ablation` | `kl01_clip_token_std0_with_kl` | `grpo_clip` | `token` | `--use_kl_penalty --kl_beta --kl_estimator` | vs `kl00_*_token_*` |
+| `kl_ablation` | `kl00_clip_seq_std0_no_kl` | `grpo_clip` | `seq` | `--no-use_kl_penalty` | vs `kl01_*_seq_*` |
+| `kl_ablation` | `kl01_clip_seq_std0_with_kl` | `grpo_clip` | `seq` | `--use_kl_penalty --kl_beta --kl_estimator` | vs `kl00_*_seq_*` |
+
+### C. DAPO-lite 消融（5 组）
+
+| 模式 | suffix | loss_type | 核心开关 | 主要对照 |
 | --- | --- | --- | --- | --- |
-| `kl_ablation` | `kl00_clip_token_std0_no_kl` | `grpo_clip + token`，不加 KL | `kl01_clip_token_std0_with_kl` | `train/avg_kl`、`train/avg_kl_loss`、`eval/accuracy` |
-| `kl_ablation` | `kl01_clip_token_std0_with_kl` | `grpo_clip + token + KL(k3,beta)` | `kl00_clip_token_std0_no_kl` | 同上，额外看 `train/avg_pg_loss` |
-| `kl_ablation` | `kl00_clip_seq_std0_no_kl` | `grpo_clip + seq`，不加 KL | `kl01_clip_seq_std0_with_kl` | `train/loss`、`train/grad_norm`、`eval/accuracy` |
-| `kl_ablation` | `kl01_clip_seq_std0_with_kl` | `grpo_clip + seq + KL(k3,beta)` | `kl00_clip_seq_std0_no_kl` | 同上，额外看 `train/avg_kl` |
-| `dapo_ablation` | `dapo00_baseline_grpo_clip_seq` | 纯 `grpo_clip + seq` baseline | `dapo01/02/03/04` | `eval/accuracy`、`train/avg_clip_fraction` |
-| `dapo_ablation` | `dapo01_decoupled_clip_seq` | `loss_type=dapo_clip`（上下限分离 clip） | `dapo00` | `train/clip_low_hit_rate`、`train/clip_high_hit_rate` |
-| `dapo_ablation` | `dapo02_decoupled_clip_filter_seq` | `dapo_clip + group_filter` | `dapo01` | `sampling/valid_group_ratio`、`sampling/resample_count` |
-| `dapo_ablation` | `dapo03_decoupled_clip_overlong_seq` | `dapo_clip + overlong_penalty` | `dapo01` | `sampling/overlong_penalty_mean`、`eval/avg_length` |
-| `dapo_ablation` | `dapo04_full_seq` | `dapo_clip + group_filter + overlong_penalty` | `dapo00`、`dapo02`、`dapo03` | `eval/accuracy`、`train/grad_norm`、长度相关指标 |
-| `gbpo_ablation` | `gbpo00_baseline_grpo_clip_seq` | 纯 `grpo_clip + seq` baseline | `gbpo01/02/03` | `eval/accuracy`、`train/grad_norm` |
-| `gbpo_ablation` | `gbpo01_signaware_seq` | `loss_type=gbpo_clip`（正负优势分开 clip） | `gbpo00` | `train/gbpo_pos_clip_hit_rate`、`train/gbpo_neg_clip_hit_rate` |
-| `gbpo_ablation` | `gbpo02_signaware_seq_kl` | `gbpo_clip + KL` | `gbpo01` | `train/avg_kl`、`train/avg_kl_loss`、`eval/accuracy` |
-| `gbpo_ablation` | `gbpo03_signaware_token` | `gbpo_clip + token aggregation` | `gbpo01` | `train/loss`、`train/avg_token_entropy`、`eval/accuracy` |
+| `dapo_ablation` | `dapo00_baseline_grpo_clip_seq` | `grpo_clip` | baseline | vs `dapo01~04` |
+| `dapo_ablation` | `dapo01_decoupled_clip_seq` | `dapo_clip` | `cliprange_low/high` | vs `dapo00` |
+| `dapo_ablation` | `dapo02_decoupled_clip_filter_seq` | `dapo_clip` | `+enable_group_filter` | vs `dapo01` |
+| `dapo_ablation` | `dapo03_decoupled_clip_overlong_seq` | `dapo_clip` | `+use_overlong_penalty` | vs `dapo01` |
+| `dapo_ablation` | `dapo04_full_seq` | `dapo_clip` | `decoupled_clip + filter + overlong` | vs `dapo00/02/03` |
 
-备注：
-- 所有批量实验默认固定 `std_off`，方便先观察核心 loss 改动。
-- `KL_BETA`、`KL_ESTIMATOR`、`CLIP_LOW/HIGH`、`GBPO_*` 可用环境变量覆盖。
-- 推荐先比较同一模式内的“相邻对照”（例如 `dapo01 -> dapo02`），再比较跨模式最佳点。
+### D. GBPO-lite 消融（4 组）
+
+| 模式 | suffix | loss_type | 核心开关 | 主要对照 |
+| --- | --- | --- | --- | --- |
+| `gbpo_ablation` | `gbpo00_baseline_grpo_clip_seq` | `grpo_clip` | baseline | vs `gbpo01~03` |
+| `gbpo_ablation` | `gbpo01_signaware_seq` | `gbpo_clip` | `gbpo_pos_* + gbpo_neg_*` | vs `gbpo00` |
+| `gbpo_ablation` | `gbpo02_signaware_seq_kl` | `gbpo_clip` | `gbpo + KL` | vs `gbpo01` |
+| `gbpo_ablation` | `gbpo03_signaware_token` | `gbpo_clip` | `gbpo + token aggregation` | vs `gbpo01` |
+
+重点建议：
+- 先看同模式内相邻对照（例如 `dapo01 -> dapo02`）
+- 再对比各模式最佳点
 
 ## W&B 细粒度日志
 
@@ -142,7 +204,23 @@ bash scripts/run_anypo_batch.sh gbpo_ablation
   - accuracy / correct / format-wrong / answer-wrong / avg_length
 
 ## KL 消融（可直接跑）
+一次性全跑
+```bash 
+cd /home/bkzhu/storage/assignment5-alignment
 
+GROUP="grpo_all_$(date +%Y%m%d_%H%M%S)"
+export WANDB_PROJECT="cs336-anypo2"
+export WANDB_GROUP="$GROUP"
+export SAVE_ROOT="/home/bkzhu/storage/assignment5-alignment/data/anypo_ckpts/$GROUP"
+
+# 可选：你的设备配置
+export DEVICE_TRAIN="cuda:0"
+export DEVICE_VLLM="cuda:1"
+
+for MODE in full token_fill kl_ablation; do
+  bash scripts/run_anypo_batch.sh "$MODE"
+done
+```
 在同一组配置上做 `+KL` 对比（建议先做在 `grpo_clip + seq + std_off`）：
 
 ```bash
@@ -192,4 +270,42 @@ uv run python cs336_alignment/train_anypo.py \
   --gbpo_neg_cliprange_low 0.05 \
   --gbpo_neg_cliprange_high 0.10 \
   --run_name gbpo_lite_seq
+```
+
+## EI（阈值筛题 + 断点续训）
+
+`cs336_alignment/ei.py` 现在支持：
+- 全训练集 pass-rate 评估后筛题：`selection_mode=static|dynamic`
+- 阈值：`--train_pass_threshold`
+- checkpoint：每个 EI step 自动保存到 `$output_path/checkpoints/ei_step_xxxx`
+- 续训：`--resume_from` 或 `--auto_resume`
+
+示例：
+
+```bash
+# 静态筛题：训练前在全训练集上评估一次，保留 pass-rate >= 0.5 的题
+uv run python cs336_alignment/ei.py \
+  --selection_mode static \
+  --train_pass_threshold 0.5 \
+  --selection_num_g 4 \
+  --n_ei_steps 3 \
+  --batch_size 4096 \
+  --epochs 6
+
+# 动态筛题：每个 EI step 前重新评估并筛题
+uv run python cs336_alignment/ei.py \
+  --selection_mode dynamic \
+  --train_pass_threshold 0.5 \
+  --selection_num_g 4 \
+  --n_ei_steps 3
+
+# 从上次中断处续训（自动找 latest checkpoint）
+uv run python cs336_alignment/ei.py --auto_resume
+```
+
+```
+uv run python cs336_alignment/ei.py \
+  --auto_resume \
+  --selection_mode dynamic \
+  --train_pass_threshold 0.6
 ```

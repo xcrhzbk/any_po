@@ -81,6 +81,9 @@ class AnyPOConfig:
     save_dir: str = ""
     save_every: int = 0
     save_best: bool = True
+    save_final_eval_outputs: bool = True
+    final_eval_output_max_samples: int = 100
+    final_eval_output_filename: str = "final_eval_outputs.jsonl"
 
 
 ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
@@ -141,14 +144,29 @@ def evaluate_vllm(
     prompts: List[str],
     answers: List[str],
     eval_sampling_params: SamplingParams,
-) -> dict[str, float]:
+    collect_samples: bool = False,
+    sample_limit: int = 100,
+) -> tuple[dict[str, float], list[dict]]:
     responses = run_vllm(vllm_model, prompts, eval_sampling_params)
     allinfo_dict_list = []
+    sample_records: list[dict] = []
     total_length = 0
-    for response, answer in zip(responses, answers):
+    for prompt, response, answer in zip(prompts, responses, answers):
         extracted_answer = extract_reference_answer(answer)
         reward_dict = reward_fn(response, extracted_answer)
         allinfo_dict_list.append(reward_dict)
+        if collect_samples and len(sample_records) < sample_limit:
+            sample_records.append(
+                {
+                    "prompt": prompt,
+                    "response": response,
+                    "answer": answer,
+                    "extracted_answer": extracted_answer,
+                    "format_reward": float(reward_dict["format_reward"]),
+                    "answer_reward": float(reward_dict["answer_reward"]),
+                    "reward": float(reward_dict["reward"]),
+                }
+            )
         total_length += len(response)
 
     overview = {"correct": 0, "format_wrong": 0, "answer_wrong": 0, "count": 0}
@@ -161,7 +179,14 @@ def evaluate_vllm(
         else:
             overview["format_wrong"] += 1
     overview["avg_length"] = total_length / max(overview["count"], 1)
-    return overview
+    return overview, sample_records
+
+
+def save_eval_outputs_jsonl(records: list[dict], output_path: str):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def load_policy_into_vllm_instance(policy: torch.nn.Module, llm: LLM):
@@ -718,7 +743,16 @@ def train_anypo(cfg: AnyPOConfig):
                 stop=["</answer>"],
                 include_stop_str_in_output=True,
             )
-            overview = evaluate_vllm(vllm, r1_zero_reward_fn, prompts, answers, eval_sampling_params)
+            is_final_eval = grpo_step == cfg.n_grpo_steps - 1
+            overview, eval_records = evaluate_vllm(
+                vllm,
+                r1_zero_reward_fn,
+                prompts,
+                answers,
+                eval_sampling_params,
+                collect_samples=is_final_eval and cfg.save_final_eval_outputs,
+                sample_limit=cfg.final_eval_output_max_samples,
+            )
             eval_acc = overview["correct"] / max(overview["count"], 1)
             wandb.log(
                 {
@@ -730,6 +764,24 @@ def train_anypo(cfg: AnyPOConfig):
                     "eval/avg_length": overview["avg_length"],
                 },
             )
+            if is_final_eval and cfg.save_final_eval_outputs:
+                if cfg.save_dir:
+                    eval_output_path = os.path.join(cfg.save_dir, cfg.final_eval_output_filename)
+                else:
+                    eval_output_dir = os.path.join(
+                        os.getcwd(),
+                        "data",
+                        "anypo_eval_outputs",
+                        run_name,
+                    )
+                    eval_output_path = os.path.join(eval_output_dir, cfg.final_eval_output_filename)
+                save_eval_outputs_jsonl(eval_records, eval_output_path)
+                wandb.log(
+                    {
+                        "grpo_step": grpo_step,
+                        "eval/final_output_count": len(eval_records),
+                    }
+                )
 
             if cfg.save_best and eval_acc > best_eval_acc:
                 best_eval_acc = eval_acc
@@ -851,6 +903,21 @@ def parse_args() -> AnyPOConfig:
     parser.add_argument("--save_dir", type=str, default=AnyPOConfig.save_dir)
     parser.add_argument("--save_every", type=int, default=AnyPOConfig.save_every)
     parser.add_argument("--save_best", action=argparse.BooleanOptionalAction, default=AnyPOConfig.save_best)
+    parser.add_argument(
+        "--save_final_eval_outputs",
+        action=argparse.BooleanOptionalAction,
+        default=AnyPOConfig.save_final_eval_outputs,
+    )
+    parser.add_argument(
+        "--final_eval_output_max_samples",
+        type=int,
+        default=AnyPOConfig.final_eval_output_max_samples,
+    )
+    parser.add_argument(
+        "--final_eval_output_filename",
+        type=str,
+        default=AnyPOConfig.final_eval_output_filename,
+    )
     args = parser.parse_args()
     return AnyPOConfig(**vars(args))
 
