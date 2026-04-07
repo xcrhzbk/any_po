@@ -51,6 +51,7 @@ class AnyPOConfig:
     eval_max_tokens: int = 1024
     eval_freq: int = 8
     eval_num_samples: int = 0
+    log_token_entropy: bool = True
     loss_type: str = "grpo_clip"
     loss_aggregation: str = "seq"  # seq | token
     use_std_normalization: bool = False
@@ -72,6 +73,18 @@ class AnyPOConfig:
     use_overlong_penalty: bool = False
     overlong_target_len: int = 256
     overlong_penalty_coef: float = 0.0
+    use_step_progress_reward: bool = False
+    step_reward_mode: str = "neg_only"  # all | neg_only
+    step_reward_alpha: float = 0.3
+    step_reward_gamma: float = 1.0
+    step_reward_lambda: float = 0.95
+    step_reward_rollouts_per_prefix: int = 2
+    step_reward_max_steps: int = 4
+    step_reward_min_chars: int = 24
+    step_reward_eval_batch_size: int = 64
+    step_reward_max_selected_samples: int = 0  # 0 means no cap
+    step_reward_sampling_temperature: float = 1.0
+    step_reward_sampling_max_tokens: int = 256
     project: str = "cs336-anypo"
     run_name: str = ""
     wandb_group: str = ""
@@ -86,13 +99,19 @@ class AnyPOConfig:
     final_eval_output_filename: str = "final_eval_outputs.jsonl"
 
 
-ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
+# Dataset-agnostic: capture the final-answer segment after "####" on that line.
+ANS_RE = re.compile(r"####\s*([^\n\r]+)")
+THINK_BLOCK_RE = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+ANSWER_OPEN_RE = re.compile(r"<answer>", re.IGNORECASE)
+STEP_MARKER_RE = re.compile(
+    r"(?im)\b(?:step\s*\d+\s*[:\)]|first[,:\s]|second[,:\s]|third[,:\s]|finally[,:\s])"
+)
 
 
 def extract_reference_answer(answer: str) -> str:
     match = ANS_RE.search(answer)
     if match:
-        return match.group(1).strip().replace(",", "")
+        return match.group(1).strip()
     return "[invalid]"
 
 
@@ -259,6 +278,284 @@ def sample_rollout_batch(
     return [random.choice(train_data) for _ in range(n_prompts)]
 
 
+def get_reasoning_region_span(response: str) -> tuple[int, int]:
+    """Locate the response span used for step segmentation."""
+    think_match = THINK_BLOCK_RE.search(response)
+    if think_match:
+        return think_match.start(1), think_match.end(1)
+    answer_match = ANSWER_OPEN_RE.search(response)
+    if answer_match:
+        return 0, answer_match.start()
+    return 0, len(response)
+
+
+def split_reasoning_steps(
+    response: str,
+    max_steps: int,
+    min_chars: int,
+) -> list[tuple[int, int]]:
+    """Split reasoning text into contiguous step spans on punctuation / step markers."""
+    region_start, region_end = get_reasoning_region_span(response)
+    if region_end <= region_start:
+        return []
+
+    reasoning_text = response[region_start:region_end]
+    if not reasoning_text.strip():
+        return []
+
+    boundaries = {0, len(reasoning_text)}
+    for match in re.finditer(r"(?<=[\n\.\,\;\:])\s+", reasoning_text):
+        boundaries.add(match.end())
+    for match in STEP_MARKER_RE.finditer(reasoning_text):
+        boundaries.add(match.start())
+    ordered = sorted(boundaries)
+
+    raw_spans: list[tuple[int, int]] = []
+    for start, end in zip(ordered[:-1], ordered[1:]):
+        if end > start and reasoning_text[start:end].strip():
+            raw_spans.append((start, end))
+    if not raw_spans:
+        return []
+
+    merged_spans: list[tuple[int, int]] = []
+    current_start, current_end = raw_spans[0]
+    for start, end in raw_spans[1:]:
+        if (current_end - current_start) < min_chars:
+            current_end = end
+        else:
+            merged_spans.append((current_start, current_end))
+            current_start, current_end = start, end
+    merged_spans.append((current_start, current_end))
+
+    if max_steps > 0 and len(merged_spans) > max_steps:
+        keep = merged_spans[: max_steps - 1]
+        keep.append((merged_spans[max_steps - 1][0], merged_spans[-1][1]))
+        merged_spans = keep
+
+    return [(region_start + start, region_start + end) for start, end in merged_spans]
+
+
+def compute_discounted_lambda_returns(
+    rewards: list[float],
+    gamma: float,
+    lam: float,
+) -> list[float]:
+    if not rewards:
+        return []
+    returns = [0.0 for _ in rewards]
+    running = 0.0
+    for idx in range(len(rewards) - 1, -1, -1):
+        running = rewards[idx] + gamma * lam * running
+        returns[idx] = running
+    return returns
+
+
+def batched_prefix_pass_rate(
+    cfg: AnyPOConfig,
+    vllm: LLM,
+    prefix_prompts: list[str],
+    answers: list[str],
+) -> list[float]:
+    if not prefix_prompts:
+        return []
+    sampling_params = SamplingParams(
+        temperature=cfg.step_reward_sampling_temperature,
+        top_p=1.0,
+        max_tokens=cfg.step_reward_sampling_max_tokens,
+        min_tokens=cfg.sampling_min_tokens,
+        stop=["</answer>"],
+        include_stop_str_in_output=True,
+        n=cfg.step_reward_rollouts_per_prefix,
+        seed=cfg.seed,
+    )
+
+    outputs = []
+    batch_size = max(cfg.step_reward_eval_batch_size, 1)
+    for start in range(0, len(prefix_prompts), batch_size):
+        end = start + batch_size
+        outputs.extend(vllm.generate(prefix_prompts[start:end], sampling_params))
+
+    pass_rates = []
+    for output, answer in zip(outputs, answers):
+        correct = 0
+        total = max(len(output.outputs), 1)
+        for candidate in output.outputs:
+            score = r1_zero_reward_fn(candidate.text, answer)["reward"]
+            correct += int(score > 0)
+        pass_rates.append(correct / total)
+    return pass_rates
+
+
+def map_step_returns_to_response_tokens(
+    tokenizer,
+    response: str,
+    response_token_count: int,
+    step_spans: list[tuple[int, int]],
+    step_returns: list[float],
+) -> torch.Tensor:
+    token_adv = torch.zeros(response_token_count, dtype=torch.float32)
+    if response_token_count == 0 or len(step_spans) == 0 or len(step_returns) == 0:
+        return token_adv
+
+    try:
+        encoding = tokenizer(
+            response,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+        )
+        offsets = encoding["offset_mapping"]
+    except Exception:
+        offsets = []
+
+    if not offsets:
+        # Fallback: assign the averaged step return to all response tokens.
+        token_adv.fill_(sum(step_returns) / len(step_returns))
+        return token_adv
+
+    usable = min(response_token_count, len(offsets))
+    for token_idx in range(usable):
+        char_start, char_end = offsets[token_idx]
+        if char_end <= char_start:
+            continue
+        char_center = 0.5 * (char_start + char_end)
+        for step_idx, (step_start, step_end) in enumerate(step_spans):
+            if step_start <= char_center < step_end:
+                token_adv[token_idx] = float(step_returns[step_idx])
+                break
+    return token_adv
+
+
+def compute_step_progress_advantages(
+    cfg: AnyPOConfig,
+    vllm: LLM,
+    tokenizer,
+    prompts: list[str],
+    responses: list[str],
+    repeated_answers: list[str],
+    response_mask_cpu: torch.Tensor,
+    raw_rewards_binary: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    batch_size, seq_len = response_mask_cpu.shape
+    token_step_adv = torch.zeros((batch_size, seq_len), dtype=torch.float32)
+    meta = {
+        "selected_samples": 0.0,
+        "selected_ratio": 0.0,
+        "prefix_queries": 0.0,
+        "step_count_mean": 0.0,
+        "step_reward_mean": 0.0,
+        "step_reward_std": 0.0,
+        "step_return_abs_mean": 0.0,
+        "token_nonzero_ratio": 0.0,
+    }
+
+    selected_indices = list(range(batch_size))
+    if cfg.step_reward_mode == "neg_only":
+        rewards_per_group = raw_rewards_binary.view(-1, cfg.group_size)
+        all_negative_groups = rewards_per_group.sum(dim=-1) == 0
+        sample_mask = all_negative_groups.repeat_interleave(cfg.group_size)
+        selected_indices = sample_mask.nonzero(as_tuple=False).squeeze(-1).tolist()
+
+    if cfg.step_reward_max_selected_samples > 0 and len(selected_indices) > cfg.step_reward_max_selected_samples:
+        selected_indices = random.sample(selected_indices, cfg.step_reward_max_selected_samples)
+    if not selected_indices:
+        return token_step_adv, meta
+
+    per_sample_spans: dict[int, list[tuple[int, int]]] = {}
+    prefix_prompts: list[str] = []
+    prefix_answers: list[str] = []
+    prefix_keys: list[tuple[int, int]] = []
+    for sample_idx in selected_indices:
+        spans = split_reasoning_steps(
+            responses[sample_idx],
+            max_steps=cfg.step_reward_max_steps,
+            min_chars=cfg.step_reward_min_chars,
+        )
+        if not spans:
+            continue
+        per_sample_spans[sample_idx] = spans
+
+        # p_0: baseline success from the original prompt (no generated reasoning prefix).
+        prefix_prompts.append(prompts[sample_idx])
+        prefix_answers.append(repeated_answers[sample_idx])
+        prefix_keys.append((sample_idx, -1))
+
+        for step_idx, (_, step_end) in enumerate(spans):
+            prefix_prompts.append(prompts[sample_idx] + responses[sample_idx][:step_end])
+            prefix_answers.append(repeated_answers[sample_idx])
+            prefix_keys.append((sample_idx, step_idx))
+
+    if not prefix_prompts:
+        return token_step_adv, meta
+
+    pass_rates = batched_prefix_pass_rate(cfg, vllm, prefix_prompts, prefix_answers)
+    pass_rate_lookup: dict[tuple[int, int], float] = {}
+    for key, pass_rate in zip(prefix_keys, pass_rates):
+        pass_rate_lookup[key] = pass_rate
+
+    all_step_rewards: list[float] = []
+    all_step_returns: list[float] = []
+    nonzero_token_count = 0
+    response_token_count_total = 0
+
+    for sample_idx, spans in per_sample_spans.items():
+        baseline_key = (sample_idx, -1)
+        if baseline_key not in pass_rate_lookup:
+            continue
+        p_prev = pass_rate_lookup[baseline_key]
+        step_rewards: list[float] = []
+        for step_idx in range(len(spans)):
+            key = (sample_idx, step_idx)
+            if key not in pass_rate_lookup:
+                continue
+            p_now = pass_rate_lookup[key]
+            step_rewards.append(p_now - p_prev)
+            p_prev = p_now
+        if not step_rewards:
+            continue
+
+        step_returns = compute_discounted_lambda_returns(
+            step_rewards,
+            gamma=cfg.step_reward_gamma,
+            lam=cfg.step_reward_lambda,
+        )
+        all_step_rewards.extend(step_rewards)
+        all_step_returns.extend(step_returns)
+
+        response_positions = response_mask_cpu[sample_idx].nonzero(as_tuple=False).squeeze(-1)
+        n_response_tokens = int(response_positions.numel())
+        if n_response_tokens == 0:
+            continue
+        response_token_count_total += n_response_tokens
+
+        token_step_adv_response = map_step_returns_to_response_tokens(
+            tokenizer=tokenizer,
+            response=responses[sample_idx],
+            response_token_count=n_response_tokens,
+            step_spans=spans,
+            step_returns=step_returns,
+        )
+        usable = min(n_response_tokens, token_step_adv_response.shape[0])
+        if usable > 0:
+            token_step_adv[sample_idx, response_positions[:usable]] = token_step_adv_response[:usable]
+            nonzero_token_count += int((token_step_adv_response[:usable].abs() > 0).sum().item())
+
+    meta["selected_samples"] = float(len(per_sample_spans))
+    meta["selected_ratio"] = float(len(per_sample_spans) / max(batch_size, 1))
+    meta["prefix_queries"] = float(len(prefix_prompts))
+    if per_sample_spans:
+        meta["step_count_mean"] = float(sum(len(spans) for spans in per_sample_spans.values()) / len(per_sample_spans))
+    if all_step_rewards:
+        rewards_tensor = torch.tensor(all_step_rewards, dtype=torch.float32)
+        meta["step_reward_mean"] = float(rewards_tensor.mean().item())
+        meta["step_reward_std"] = float(rewards_tensor.std(unbiased=False).item())
+    if all_step_returns:
+        returns_tensor = torch.tensor(all_step_returns, dtype=torch.float32)
+        meta["step_return_abs_mean"] = float(returns_tensor.abs().mean().item())
+    if response_token_count_total > 0:
+        meta["token_nonzero_ratio"] = float(nonzero_token_count / response_token_count_total)
+    return token_step_adv, meta
+
+
 def collect_rollouts_with_optional_group_filter(
     cfg: AnyPOConfig,
     train_data: list[dict],
@@ -405,10 +702,16 @@ def train_anypo(cfg: AnyPOConfig):
     assert cfg.loss_aggregation in {"seq", "token"}
     assert cfg.kl_estimator in {"k1", "k2", "k3"}
     assert cfg.kl_ref_mode in {"old"}
+    assert cfg.step_reward_mode in {"all", "neg_only"}
     assert cfg.train_batch_size % cfg.gradient_accumulation_steps == 0
     assert cfg.rollout_batch_size % cfg.group_size == 0
     assert cfg.train_batch_size >= cfg.group_size
     assert cfg.max_filter_resample_rounds >= 1
+    assert cfg.step_reward_rollouts_per_prefix >= 1
+    assert cfg.step_reward_eval_batch_size >= 1
+    assert cfg.step_reward_max_steps >= 1
+    if cfg.use_step_progress_reward:
+        assert cfg.loss_type != "no_baseline", "step reward requires advantage-based loss"
 
     micro_train_batch_size = cfg.train_batch_size // cfg.gradient_accumulation_steps
     n_prompts_per_rollout_batch = cfg.rollout_batch_size // cfg.group_size
@@ -430,6 +733,7 @@ def train_anypo(cfg: AnyPOConfig):
         f"group_filter:{int(cfg.enable_group_filter)}",
         f"overlong:{int(cfg.use_overlong_penalty)}",
         f"kl:{int(cfg.use_kl_penalty)}",
+        f"step_progress:{int(cfg.use_step_progress_reward)}",
     ]
     tags = sorted(set(tags + auto_tags))
     wandb.init(
@@ -477,7 +781,8 @@ def train_anypo(cfg: AnyPOConfig):
         tokenization = tokenize_prompt_and_output(prompts, responses, tokenizer)
         input_ids = tokenization["input_ids"].to(cfg.device_train)
         labels = tokenization["labels"].to(cfg.device_train)
-        response_mask = tokenization["response_mask"].to(cfg.device_train)
+        response_mask_cpu = tokenization["response_mask"]
+        response_mask = response_mask_cpu.to(cfg.device_train)
 
         advantages_train, raw_rewards_train, reward_meta = compute_group_normalized_reward(
             r1_zero_reward_fn,
@@ -504,12 +809,41 @@ def train_anypo(cfg: AnyPOConfig):
                 cfg.use_std_normalization,
             )
 
+        token_step_advantages = torch.zeros_like(response_mask_cpu, dtype=torch.float32)
+        step_meta = {
+            "selected_samples": 0.0,
+            "selected_ratio": 0.0,
+            "prefix_queries": 0.0,
+            "step_count_mean": 0.0,
+            "step_reward_mean": 0.0,
+            "step_reward_std": 0.0,
+            "step_return_abs_mean": 0.0,
+            "token_nonzero_ratio": 0.0,
+        }
+        if cfg.use_step_progress_reward:
+            token_step_advantages, step_meta = compute_step_progress_advantages(
+                cfg=cfg,
+                vllm=vllm,
+                tokenizer=tokenizer,
+                prompts=prompts,
+                responses=responses,
+                repeated_answers=repeated_answers,
+                response_mask_cpu=response_mask_cpu,
+                raw_rewards_binary=raw_rewards_binary,
+            )
+
         all_negative_group_ratio, all_positive_group_ratio = group_homogeneity_stats(
             raw_rewards_binary, cfg.group_size
         )
         reward_breakdown = compute_reward_breakdown(r1_zero_reward_fn, responses, repeated_answers)
         response_lengths = torch.tensor([len(r) for r in responses], dtype=torch.float32)
+        token_advantages_train = None
+        if cfg.use_step_progress_reward:
+            seq_adv = advantages_train.unsqueeze(-1).repeat(1, response_mask_cpu.shape[1])
+            token_advantages_train = seq_adv + cfg.step_reward_alpha * token_step_advantages
         advantages_train = advantages_train.to(cfg.device_train)
+        if token_advantages_train is not None:
+            token_advantages_train = token_advantages_train.to(cfg.device_train)
         raw_rewards_train = raw_rewards_train.to(cfg.device_train)
 
         wandb.log(
@@ -539,6 +873,15 @@ def train_anypo(cfg: AnyPOConfig):
                 "sampling/overlong_excess_mean": overlong_excess.mean().item(),
                 "sampling/overlong_excess_max": overlong_excess.max().item(),
                 "sampling/overlong_penalty_mean": overlong_penalty.mean().item(),
+                "sampling/use_step_progress_reward": float(cfg.use_step_progress_reward),
+                "sampling/step_selected_samples": step_meta["selected_samples"],
+                "sampling/step_selected_ratio": step_meta["selected_ratio"],
+                "sampling/step_prefix_queries": step_meta["prefix_queries"],
+                "sampling/step_count_mean": step_meta["step_count_mean"],
+                "sampling/step_reward_mean": step_meta["step_reward_mean"],
+                "sampling/step_reward_std": step_meta["step_reward_std"],
+                "sampling/step_return_abs_mean": step_meta["step_return_abs_mean"],
+                "sampling/step_token_nonzero_ratio": step_meta["token_nonzero_ratio"],
             },
         )
 
@@ -574,13 +917,17 @@ def train_anypo(cfg: AnyPOConfig):
                 accumulated_gbpo_pos_hit = 0.0
                 accumulated_gbpo_neg_hit = 0.0
                 accumulated_ratio_extreme = 0.0
+                accumulated_step_adv_abs = 0.0
 
                 for train_microstep in range(cfg.gradient_accumulation_steps):
                     micro_start = batch_start + train_microstep * micro_train_batch_size
                     micro_end = micro_start + micro_train_batch_size
 
                     raw_rewards = raw_rewards_train[micro_start:micro_end].unsqueeze(-1)
-                    advantages = advantages_train[micro_start:micro_end].unsqueeze(-1)
+                    if token_advantages_train is not None:
+                        advantages = token_advantages_train[micro_start:micro_end]
+                    else:
+                        advantages = advantages_train[micro_start:micro_end].unsqueeze(-1)
                     old_log_probs = old_log_probs_train[micro_start:micro_end]
                     response_mask_micro_batch = response_mask[micro_start:micro_end]
 
@@ -588,10 +935,16 @@ def train_anypo(cfg: AnyPOConfig):
                         model,
                         input_ids=input_ids[micro_start:micro_end],
                         labels=labels[micro_start:micro_end],
-                        return_token_entropy=True,
+                        return_token_entropy=cfg.log_token_entropy,
                     )
                     policy_log_probs = log_probs_dict["log_probs"]
-                    token_entropy = log_probs_dict["token_entropy"]
+                    token_entropy = log_probs_dict.get("token_entropy")
+                    if token_advantages_train is not None:
+                        accumulated_step_adv_abs += masked_mean(
+                            advantages.abs(),
+                            response_mask_micro_batch,
+                            dim=None,
+                        ).item()
                     loss_kwargs = {
                         "raw_rewards": raw_rewards,
                         "advantages": advantages,
@@ -648,9 +1001,10 @@ def train_anypo(cfg: AnyPOConfig):
                                 **loss_kwargs,
                             )
 
-                    accumulated_token_entropy += masked_mean(
-                        token_entropy, response_mask_micro_batch, dim=None
-                    ).item()
+                    if token_entropy is not None:
+                        accumulated_token_entropy += masked_mean(
+                            token_entropy, response_mask_micro_batch, dim=None
+                        ).item()
                     if "cliped" in metadata:
                         accumulated_clip_fraction += masked_mean(
                             metadata["cliped"], response_mask_micro_batch, dim=None
@@ -697,7 +1051,9 @@ def train_anypo(cfg: AnyPOConfig):
                         "train/lr": optimizer.param_groups[0]["lr"],
                         "train/loss": loss.item() * cfg.gradient_accumulation_steps,
                         "train/avg_token_entropy": accumulated_token_entropy
-                        / cfg.gradient_accumulation_steps,
+                        / cfg.gradient_accumulation_steps
+                        if cfg.log_token_entropy
+                        else 0.0,
                         "train/avg_clip_fraction": accumulated_clip_fraction
                         / cfg.gradient_accumulation_steps,
                         "train/grad_norm": grad_norm,
@@ -723,6 +1079,10 @@ def train_anypo(cfg: AnyPOConfig):
                         / cfg.gradient_accumulation_steps,
                         "train/ratio_extreme_rate": accumulated_ratio_extreme
                         / cfg.gradient_accumulation_steps,
+                        "train/step_adv_abs_mean": accumulated_step_adv_abs
+                        / cfg.gradient_accumulation_steps
+                        if token_advantages_train is not None
+                        else 0.0,
                     },
                 )
                 update_step += 1
@@ -822,6 +1182,11 @@ def parse_args() -> AnyPOConfig:
     parser.add_argument("--eval_freq", type=int, default=AnyPOConfig.eval_freq)
     parser.add_argument("--eval_num_samples", type=int, default=AnyPOConfig.eval_num_samples)
     parser.add_argument(
+        "--log_token_entropy",
+        action=argparse.BooleanOptionalAction,
+        default=AnyPOConfig.log_token_entropy,
+    )
+    parser.add_argument(
         "--loss_type",
         choices=[
             "no_baseline",
@@ -889,6 +1254,46 @@ def parse_args() -> AnyPOConfig:
     )
     parser.add_argument("--overlong_target_len", type=int, default=AnyPOConfig.overlong_target_len)
     parser.add_argument("--overlong_penalty_coef", type=float, default=AnyPOConfig.overlong_penalty_coef)
+    parser.add_argument(
+        "--use_step_progress_reward",
+        action=argparse.BooleanOptionalAction,
+        default=AnyPOConfig.use_step_progress_reward,
+    )
+    parser.add_argument(
+        "--step_reward_mode",
+        choices=["all", "neg_only"],
+        default=AnyPOConfig.step_reward_mode,
+    )
+    parser.add_argument("--step_reward_alpha", type=float, default=AnyPOConfig.step_reward_alpha)
+    parser.add_argument("--step_reward_gamma", type=float, default=AnyPOConfig.step_reward_gamma)
+    parser.add_argument("--step_reward_lambda", type=float, default=AnyPOConfig.step_reward_lambda)
+    parser.add_argument(
+        "--step_reward_rollouts_per_prefix",
+        type=int,
+        default=AnyPOConfig.step_reward_rollouts_per_prefix,
+    )
+    parser.add_argument("--step_reward_max_steps", type=int, default=AnyPOConfig.step_reward_max_steps)
+    parser.add_argument("--step_reward_min_chars", type=int, default=AnyPOConfig.step_reward_min_chars)
+    parser.add_argument(
+        "--step_reward_eval_batch_size",
+        type=int,
+        default=AnyPOConfig.step_reward_eval_batch_size,
+    )
+    parser.add_argument(
+        "--step_reward_max_selected_samples",
+        type=int,
+        default=AnyPOConfig.step_reward_max_selected_samples,
+    )
+    parser.add_argument(
+        "--step_reward_sampling_temperature",
+        type=float,
+        default=AnyPOConfig.step_reward_sampling_temperature,
+    )
+    parser.add_argument(
+        "--step_reward_sampling_max_tokens",
+        type=int,
+        default=AnyPOConfig.step_reward_sampling_max_tokens,
+    )
     parser.add_argument("--project", type=str, default=AnyPOConfig.project)
     parser.add_argument("--run_name", type=str, default=AnyPOConfig.run_name)
     parser.add_argument("--wandb_group", type=str, default=AnyPOConfig.wandb_group)

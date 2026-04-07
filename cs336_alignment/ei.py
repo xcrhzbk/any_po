@@ -29,7 +29,8 @@ TEST_DATA_PATH = "/home/bkzhu/storage/assignment5-alignment/data/gsm8k/test.json
 TRAIN_DATA_PATH = "/home/bkzhu/storage/assignment5-alignment/data/gsm8k/processed_train.jsonl"
 OUTPUT_PATH = "/home/bkzhu/storage/assignment5-alignment/data/ei_zero"
 
-ANS_RE = re.compile(r"####\s*([\-0-9\.\,]+)")
+# Dataset-agnostic: capture the full answer after "####" on that line.
+ANS_RE = re.compile(r"####\s*([^\n\r]+)")
 ANSWER_TAG_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
 
 
@@ -50,7 +51,7 @@ def load_jsonl(file_path: str) -> list[dict]:
 def extract_reference_answer_gsm8k(answer: str) -> str:
     match = ANS_RE.search(answer)
     if match:
-        return match.group(1).strip().replace(",", "")
+        return match.group(1).strip()
     return "[invalid]"
 
 
@@ -282,6 +283,18 @@ def collect_expert_rollouts(
     return expert_roll, overview_float
 
 
+def compute_step_threshold(args, ei_step: int) -> float:
+    """Compute pass-rate threshold for the current EI step."""
+    if not args.auto_threshold_decay:
+        return float(args.train_pass_threshold)
+    if args.n_ei_steps <= 1:
+        return float(args.threshold_end)
+    start = float(args.train_pass_threshold)
+    end = float(args.threshold_end)
+    progress = ei_step / float(max(args.n_ei_steps - 1, 1))
+    return start + (end - start) * progress
+
+
 def save_ei_checkpoint(
     model: torch.nn.Module,
     tokenizer: PreTrainedTokenizerBase,
@@ -457,6 +470,9 @@ def main(args):
     static_selection_meta: dict[str, float] | None = None
 
     if args.selection_mode == "static":
+        if args.auto_threshold_decay:
+            raise ValueError("selection_mode=static does not support --auto_threshold_decay.")
+        current_threshold = float(args.train_pass_threshold)
         selection_rollouts = args.selection_num_g if args.selection_num_g > 0 else args.ei_num_g
         train_stats = compute_train_pass_rates(
             vllm,
@@ -467,7 +483,7 @@ def main(args):
             args.selection_temperature,
         )
         static_selected_pool, static_selection_meta = select_train_pool(
-            train_qa, train_stats, args.train_pass_threshold
+            train_qa, train_stats, current_threshold
         )
         wandb.log(
             {
@@ -484,6 +500,8 @@ def main(args):
         print("------------------------------")
         print(f"Expert iteration step: {ei_step}")
         print(f"Global step now: {global_step}")
+        current_threshold = compute_step_threshold(args, ei_step)
+        print(f"Current pass-rate threshold: {current_threshold:.4f}")
 
         if args.selection_mode == "dynamic":
             selection_rollouts = args.selection_num_g if args.selection_num_g > 0 else args.ei_num_g
@@ -495,14 +513,14 @@ def main(args):
                 args.selection_max_tokens,
                 args.selection_temperature,
             )
-            selected_pool, selection_meta = select_train_pool(train_qa, train_stats, args.train_pass_threshold)
+            selected_pool, selection_meta = select_train_pool(train_qa, train_stats, current_threshold)
         elif args.selection_mode == "static":
             selected_pool = static_selected_pool if static_selected_pool is not None else train_qa
             selection_meta = static_selection_meta if static_selection_meta is not None else {
                 "selected_count": float(len(selected_pool)),
                 "selected_ratio": float(len(selected_pool) / max(len(train_qa), 1)),
                 "mean_pass_rate": 0.0,
-                "threshold": args.train_pass_threshold,
+                "threshold": current_threshold,
                 "selection_fallback_used": 0.0,
             }
         else:
@@ -511,7 +529,7 @@ def main(args):
                 "selected_count": float(len(selected_pool)),
                 "selected_ratio": 1.0,
                 "mean_pass_rate": 0.0,
-                "threshold": args.train_pass_threshold,
+                "threshold": current_threshold,
                 "selection_fallback_used": 0.0,
             }
 
@@ -599,6 +617,13 @@ if __name__ == "__main__":
 
     parser.add_argument("--selection_mode", choices=["none", "static", "dynamic"], default="none")
     parser.add_argument("--train_pass_threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--auto_threshold_decay",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Linearly decay threshold from train_pass_threshold to threshold_end across EI steps.",
+    )
+    parser.add_argument("--threshold_end", type=float, default=0.0)
     parser.add_argument("--selection_num_g", type=int, default=0)
     parser.add_argument("--selection_batch_size", type=int, default=256)
     parser.add_argument("--selection_max_tokens", type=int, default=512)

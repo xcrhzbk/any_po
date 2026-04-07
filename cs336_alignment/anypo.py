@@ -49,20 +49,26 @@ the ground truths, producing a dict with keys "reward", "format_reward", and
 
 
 def compute_naive_policy_gradient_loss(
-    raw_rewards_or_advantages: torch.Tensor,    # batch_size, 1
-    policy_log_probs: torch.Tensor       # batch_size,  seq_len
-) -> torch.Tensor: 
+    raw_rewards_or_advantages: torch.Tensor,    # (batch, 1) or (batch, seq_len)
+    policy_log_probs: torch.Tensor       # (batch, seq_len)
+) -> torch.Tensor:
     _, seq_len = policy_log_probs.shape
-    raw_rewards_or_advantages = repeat(
-        raw_rewards_or_advantages,
-        "b 1 -> b s",
-        s=seq_len
-    ) # (batch_size, seq_len)
-    loss = -raw_rewards_or_advantages * policy_log_probs # (batch_size, seq_len)
+    if raw_rewards_or_advantages.dim() == 2 and raw_rewards_or_advantages.shape[1] == seq_len:
+        expanded = raw_rewards_or_advantages
+    else:
+        expanded = repeat(
+            raw_rewards_or_advantages,
+            "b 1 -> b s",
+            s=seq_len
+        ) # (batch_size, seq_len)
+    loss = -expanded * policy_log_probs # (batch_size, seq_len)
     return loss
 
 
 def _expand_advantages(advantages: torch.Tensor, seq_len: int) -> torch.Tensor:
+    # Supports both sequence-level (batch, 1) and token-level (batch, seq_len) advantages.
+    if advantages.dim() == 2 and advantages.shape[1] == seq_len:
+        return advantages
     return repeat(advantages, "b 1 -> b s", s=seq_len)
 
 def compute_grpo_no_clip_loss(
