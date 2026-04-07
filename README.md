@@ -1,6 +1,10 @@
 # any_po
 
-统一测试 AnyPO / GRPO 变体的实验仓库。
+做完了 cs336，不知道还能做什么？
+cs336 作业 5 改参数太麻烦？
+
+anypo，在 cs336 作业 5 的基础上，结合GRPO 相关改进（DAPO-lite、GBPO-lite、Step-Progress）和 EI 动态筛题，提供一套更完整、更易用的训练代码
+
 
 ## 训练入口
 
@@ -47,7 +51,7 @@ uv run python cs336_alignment/train_anypo.py \
   --seed 69 \
   --project cs336-anypo \
   --run_name anypo_smoke \
-  --save_dir /home/bkzhu/storage/assignment5-alignment/data/anypo_ckpts
+  --save_dir /home/<your path>/assignment5-alignment/data/anypo_ckpts
 ```
 
 说明：`use_kl_penalty` 默认关闭。也就是说，老实验命令不需要任何修改，行为与之前一致。
@@ -67,13 +71,13 @@ uv run python cs336_alignment/train_anypo.py \
 推荐直接用：
 
 ```bash
-cd /home/bkzhu/storage/assignment5-alignment
+cd /home/<your path>/assignment5-alignment
 
 export WANDB_PROJECT=any3
 export WANDB_GROUP_BASE=anypo_all_$(date +%Y%m%d_%H%M%S)
-export SAVE_ROOT_BASE=/home/bkzhu/storage/assignment5-alignment/data/anypo_ckpts/$WANDB_GROUP_BASE
-export TRAIN_DATA_PATH=/home/bkzhu/storage/assignment5-alignment/data/math12k/train.jsonl
-export TEST_DATA_PATH=/home/bkzhu/storage/assignment5-alignment/data/math12k/test.jsonl
+export SAVE_ROOT_BASE=/home/<your path>/assignment5-alignment/data/anypo_ckpts/$WANDB_GROUP_BASE
+export TRAIN_DATA_PATH=/home/<your path>/assignment5-alignment/data/math12k/train.jsonl
+export TEST_DATA_PATH=/home/<your path>/assignment5-alignment/data/math12k/test.jsonl
 export DEVICE_TRAIN=cuda:0
 export DEVICE_VLLM=cuda:1
 printf "TRAIN=%s\nTEST=%s\nDEV_TRAIN=%s\nDEV_VLLM=%s\nPROJECT=%s\n" \
@@ -151,8 +155,8 @@ uv run python cs336_alignment/prepare_math12k.py
 切换数据集（不改脚本）：
 
 ```bash
-export TRAIN_DATA_PATH=/home/bkzhu/storage/assignment5-alignment/data/math12k/train.jsonl
-export TEST_DATA_PATH=/home/bkzhu/storage/assignment5-alignment/data/math12k/test.jsonl
+export TRAIN_DATA_PATH=/home/<your path>/assignment5-alignment/data/math12k/train.jsonl
+export TEST_DATA_PATH=/home/<your path>/assignment5-alignment/data/math12k/test.jsonl
 bash scripts/run_anypo_suite.sh grpo_core
 ```
 
