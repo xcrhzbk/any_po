@@ -3,7 +3,7 @@
 做完了 cs336，不知道还能做什么？
 cs336 作业 5 改参数太麻烦？
 
-anypo，在 cs336 作业 5 的基础上，结合GRPO 相关改进（DAPO-lite、GBPO-lite、Step-Progress）和 EI 动态筛题，提供一套更完整、更易用的训练代码
+anypo，在 cs336 作业 5 的基础上，结合GRPO 相关改进（DAPO、GBPO、Step-Progress, GSPO,OPSD）和 EI 按难度动态筛题，提供不同 loss ，kl，on/off policy 配置，一键启动消融实验。
 
 
 ## 训练入口
